@@ -3,15 +3,15 @@
  *
  * Foundation-first architecture:
  * - MO (Mobile Optimization) is the first user-facing feature.
- * - HeightGeometryFoundation is the stable core for the future
- *   height-map -> proportional real-geometry pipeline.
+ * - HeightGeometryFoundation is the stable core for the height-map pipeline.
+ * - GeometryReconstructionEngine is the first real geometry consumer of that foundation.
  *
  * FOUNDATION RULE:
  * The foundation does not depend on Blockbench's private geometry internals.
  * It owns data validation, height normalization, sampling, smoothing,
  * proportional depth mapping, feature thresholds, budgets, cancellation,
- * and transaction planning. A future Blockbench geometry adapter can consume
- * the foundation's plan without changing the core math.
+ * and transaction planning. Geometry creation consumes the foundation plan
+ * instead of changing its math.
  *
  * VERSION RULE:
  * - BETTER-PBR uses whole-number major versions only.
@@ -28,22 +28,19 @@
     'use strict';
 
     const PLUGIN_ID = 'better_pbr';
-    const PLUGIN_VERSION = '2.0.0';
+    const PLUGIN_VERSION = '3.0.0';
     const MO_STORAGE_KEY = 'better_pbr.mo.enabled';
 
     let moAction;
+    let geometryAction;
     let updateTimer = null;
     let running = false;
 
-    // Keep original texture sampling settings so MO can be disabled cleanly.
     const originalTextureState = new WeakMap();
 
     /* --------------------------------------------------------------------- */
     /* HeightGeometryFoundation                                             */
     /* --------------------------------------------------------------------- */
-    // This namespace is deliberately independent from Blockbench mesh APIs.
-    // That separation is the main protection against a geometry implementation
-    // error corrupting the rest of the plugin.
     const HeightGeometryFoundation = (() => {
         const EPSILON = 1e-8;
         const DEFAULTS = Object.freeze({
@@ -113,6 +110,11 @@
             result.smoothing = clamp01(result.smoothing);
             result.lowThreshold = clamp01(result.lowThreshold);
             result.highThreshold = clamp01(result.highThreshold);
+            if (result.highThreshold < result.lowThreshold) {
+                const swap = result.lowThreshold;
+                result.lowThreshold = result.highThreshold;
+                result.highThreshold = swap;
+            }
             result.minimumFeatureSize = Math.max(0, finiteNumber(result.minimumFeatureSize, DEFAULTS.minimumFeatureSize));
             result.wallWidth = Math.max(0, finiteNumber(result.wallWidth, DEFAULTS.wallWidth));
             result.edgeSoftness = clamp01(result.edgeSoftness);
@@ -131,15 +133,12 @@
                     data: source.data,
                     width: source.width,
                     height: source.height,
-                    channels: 4
+                    channels: source.channels || 4
                 };
             }
 
-            if (source instanceof Uint8Array || source instanceof Uint8ClampedArray || source instanceof Float32Array) {
-                throw new FoundationError('Typed-array height maps require width and height.', 'MISSING_DIMENSIONS');
-            }
-
-            if (typeof document !== 'undefined' && (source instanceof HTMLImageElement || source instanceof HTMLCanvasElement)) {
+            if (typeof HTMLImageElement !== 'undefined' && source instanceof HTMLImageElement ||
+                typeof HTMLCanvasElement !== 'undefined' && source instanceof HTMLCanvasElement) {
                 const canvas = document.createElement('canvas');
                 canvas.width = source.naturalWidth || source.width;
                 canvas.height = source.naturalHeight || source.height;
@@ -186,8 +185,6 @@
             }
 
             sample(u, v) {
-                // Bilinear sampling keeps proportional depth continuous instead
-                // of locking the future geometry to integer image pixels.
                 u = clamp01(u);
                 v = clamp01(v);
                 const fx = u * (this.width - 1);
@@ -206,13 +203,11 @@
             }
 
             clone() {
-                return new HeightField(this.width, this.height, this.values, this.metadata);
+                return new HeightField(this.width, this.height, new Float32Array(this.values), this.metadata);
             }
         }
 
         function luminance(r, g, b) {
-            // Relative luminance is stable for RGB sources and gives the
-            // foundation a single authoritative grayscale depth value.
             return clamp01((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255);
         }
 
@@ -273,15 +268,12 @@
                     output[field.index(x, y)] = source[field.index(x, y)] * (1 - amount) + blurred * amount;
                 }
             }
-
             return new HeightField(field.width, field.height, output, field.metadata);
         }
 
         function depthAt(field, u, v, options) {
             options = normalizeOptions(options);
             const h = field.sample(u, v);
-            // Height is always proportional to the configured depth range.
-            // 0 is the lowest plane; 1 is the highest plane.
             return options.baseDepth + h * options.depth;
         }
 
@@ -292,9 +284,9 @@
                 if (token && (y & 15) === 0) token.throwIfCancelled();
                 for (let x = 0; x < field.width; x++) {
                     const value = field.get(x, y);
-                    let kind = 1; // middle/slope
-                    if (value <= options.lowThreshold) kind = 0; // low/recessed
-                    else if (value >= options.highThreshold) kind = 2; // high/raised
+                    let kind = 1;
+                    if (value <= options.lowThreshold) kind = 0;
+                    else if (value >= options.highThreshold) kind = 2;
                     classes[field.index(x, y)] = kind;
                 }
             }
@@ -330,13 +322,12 @@
                         minY = Math.min(minY, cy);
                         maxY = Math.max(maxY, cy);
 
-                        const neighbors = [
-                            [cx - 1, cy], [cx + 1, cy],
-                            [cx, cy - 1], [cx, cy + 1]
-                        ];
-                        for (let n = 0; n < neighbors.length; n++) {
-                            const nx = neighbors[n][0];
-                            const ny = neighbors[n][1];
+                        const nx0 = cx - 1, nx1 = cx + 1, ny0 = cy - 1, ny1 = cy + 1;
+                        const neighbors = [nx0, nx1, cx, cx];
+                        const neighborY = [cy, cy, ny0, ny1];
+                        for (let n = 0; n < 4; n++) {
+                            const nx = neighbors[n];
+                            const ny = neighborY[n];
                             if (nx < 0 || ny < 0 || nx >= field.width || ny >= field.height) continue;
                             const ni = field.index(nx, ny);
                             if (visited[ni] || classes[ni] !== classId) continue;
@@ -386,24 +377,17 @@
             options = normalizeOptions(options);
             token = token || new CancellationToken();
             token.throwIfCancelled();
-
             let field = fromSource(source, options);
             token.throwIfCancelled();
             field = smooth(field, options.smoothing, token);
             token.throwIfCancelled();
-
             const classes = classify(field, options, token);
             const budget = estimateBudget(field, options);
             if (!budget.safe) {
                 throw new FoundationError('Geometry budget exceeds the configured mobile-safe limit.', 'BUDGET_EXCEEDED');
             }
-
-            // Region analysis is computed now because it is cheap compared to
-            // geometry creation and gives future hybrid/extrusion modes a stable
-            // representation of basins and raised regions.
             const lowRegions = countRegionCells(field, classes, 0, token);
             const highRegions = countRegionCells(field, classes, 2, token);
-
             return Object.freeze({
                 version: 1,
                 field,
@@ -435,11 +419,190 @@
         });
     })();
 
-    // Expose a namespaced foundation for future feature modules without
-    // polluting the global namespace or coupling the core to Blockbench.
+    /* --------------------------------------------------------------------- */
+    /* GeometryReconstructionEngine                                          */
+    /* --------------------------------------------------------------------- */
+    // Version 3.0.0 deliberately implements one simple, auditable geometry
+    // path first: a proportional height-field surface. Region-aware walls,
+    // cavities and hybrid reconstruction remain extension points for DUFP.
+    const GeometryReconstructionEngine = (() => {
+        const VERSION = 1;
+
+        function chooseGrid(plan) {
+            const maxVertices = plan.options.maxVertices;
+            const field = plan.field;
+            const maxSide = Math.max(2, Math.floor(Math.sqrt(maxVertices)));
+            let width = Math.min(field.width, maxSide);
+            let height = Math.min(field.height, Math.max(2, Math.floor(maxVertices / width)));
+            while (width * height > maxVertices && height > 2) height--;
+            while (width * height > maxVertices && width > 2) width--;
+            return {width: Math.max(2, width), height: Math.max(2, height)};
+        }
+
+        function buildSurface(plan, token) {
+            if (!plan || !plan.field || !plan.options) {
+                throw new HeightGeometryFoundation.FoundationError('A valid foundation plan is required.', 'NO_PLAN');
+            }
+            token = token || new HeightGeometryFoundation.CancellationToken();
+            token.throwIfCancelled();
+
+            const grid = chooseGrid(plan);
+            const vertices = {};
+            const faces = [];
+            const width = grid.width;
+            const height = grid.height;
+            const xScale = width > 1 ? 16 / (width - 1) : 16;
+            const zScale = height > 1 ? 16 / (height - 1) : 16;
+
+            for (let y = 0; y < height; y++) {
+                if ((y & 7) === 0) token.throwIfCancelled();
+                const v = y / (height - 1);
+                for (let x = 0; x < width; x++) {
+                    const u = x / (width - 1);
+                    const key = `v${y * width + x}`;
+                    vertices[key] = [
+                        u * 16,
+                        plan.depthAt(u, v),
+                        v * 16
+                    ];
+                }
+            }
+
+            for (let y = 0; y < height - 1; y++) {
+                if ((y & 15) === 0) token.throwIfCancelled();
+                for (let x = 0; x < width - 1; x++) {
+                    const a = `v${y * width + x}`;
+                    const b = `v${y * width + x + 1}`;
+                    const c = `v${(y + 1) * width + x + 1}`;
+                    const d = `v${(y + 1) * width + x}`;
+                    faces.push({
+                        vertices: [a, b, c, d],
+                        uv: {
+                            [a]: [uCoord(x, width), 16 - vCoord(y, height)],
+                            [b]: [uCoord(x + 1, width), 16 - vCoord(y, height)],
+                            [c]: [uCoord(x + 1, width), 16 - vCoord(y + 1, height)],
+                            [d]: [uCoord(x, width), 16 - vCoord(y + 1, height)]
+                        }
+                    });
+                }
+            }
+
+            return Object.freeze({
+                version: VERSION,
+                mode: 'height_field_surface',
+                width,
+                height,
+                vertices: Object.freeze(vertices),
+                faces: Object.freeze(faces),
+                vertexCount: width * height,
+                faceCount: faces.length
+            });
+        }
+
+        function uCoord(index, size) {
+            return size > 1 ? (index / (size - 1)) * 16 : 0;
+        }
+
+        function vCoord(index, size) {
+            return size > 1 ? (index / (size - 1)) * 16 : 0;
+        }
+
+        function createBlockbenchMesh(surface, texture) {
+            if (typeof Mesh === 'undefined' || typeof MeshFace === 'undefined') {
+                throw new HeightGeometryFoundation.FoundationError('Blockbench Mesh APIs are unavailable.', 'MESH_API_UNAVAILABLE');
+            }
+
+            const mesh = new Mesh({
+                name: 'BETTER-PBR Height Surface',
+                vertices: surface.vertices,
+                origin: [0, 0, 0],
+                rotation: [0, 0, 0],
+                shading: 'smooth',
+                visibility: true
+            }).init();
+
+            const faceObjects = surface.faces.map(face => new MeshFace(mesh, {
+                vertices: face.vertices,
+                uv: face.uv
+            }));
+            mesh.addFaces(...faceObjects);
+            if (texture && typeof mesh.applyTexture === 'function') {
+                mesh.applyTexture(texture);
+            }
+            mesh.addTo('root');
+            if (typeof mesh.calculateNormals === 'function') mesh.calculateNormals();
+            if (typeof Canvas !== 'undefined' && Canvas.updateView) {
+                Canvas.updateView({
+                    elements: [mesh],
+                    element_aspects: {geometry: true, faces: true, uv: true},
+                    selection: true
+                });
+            }
+            return mesh;
+        }
+
+        return Object.freeze({VERSION, chooseGrid, buildSurface, createBlockbenchMesh});
+    })();
+
     if (typeof globalThis !== 'undefined') {
         globalThis.BETTER_PBR = globalThis.BETTER_PBR || {};
         globalThis.BETTER_PBR.HeightGeometryFoundation = HeightGeometryFoundation;
+        globalThis.BETTER_PBR.GeometryReconstructionEngine = GeometryReconstructionEngine;
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* Height -> 3D action                                                  */
+    /* --------------------------------------------------------------------- */
+
+    function getSelectedTextureSource() {
+        if (typeof Texture === 'undefined') return null;
+        const texture = Texture.selected;
+        if (!texture) return null;
+        const canvas = texture.canvas || (typeof texture.getActiveCanvas === 'function' && texture.getActiveCanvas().canvas);
+        if (!canvas) return null;
+        return {texture, source: canvas};
+    }
+
+    function reconstructSelectedTexture() {
+        const selected = getSelectedTextureSource();
+        if (!selected) {
+            Blockbench.showQuickMessage('BETTER-PBR: select a texture first.');
+            return;
+        }
+        const token = new HeightGeometryFoundation.CancellationToken();
+        const options = HeightGeometryFoundation.normalizeOptions({
+            maxResolution: Blockbench.isMobile ? 64 : 128,
+            maxVertices: Blockbench.isMobile ? 4096 : 16384,
+            maxFaces: Blockbench.isMobile ? 8192 : 32768,
+            depth: 4,
+            baseDepth: 0,
+            smoothing: 0,
+            mode: 'height_field'
+        });
+
+        try {
+            const plan = HeightGeometryFoundation.buildPlan(selected.source, options, token);
+            const surface = GeometryReconstructionEngine.buildSurface(plan, token);
+
+            if (typeof Undo !== 'undefined' && Undo.initEdit) {
+                Undo.initEdit({elements: [], outliner: true, selection: true});
+            }
+
+            try {
+                const mesh = GeometryReconstructionEngine.createBlockbenchMesh(surface, selected.texture);
+                if (typeof Undo !== 'undefined' && Undo.finishEdit) {
+                    Undo.finishEdit('BETTER-PBR: Height to 3D');
+                }
+                Blockbench.showQuickMessage(`BETTER-PBR: created ${surface.vertexCount} vertices / ${surface.faceCount} faces`);
+                return mesh;
+            } catch (error) {
+                if (typeof Undo !== 'undefined' && Undo.cancelEdit) Undo.cancelEdit(true);
+                throw error;
+            }
+        } catch (error) {
+            console.error('BETTER-PBR height reconstruction failed:', error);
+            Blockbench.showQuickMessage(`BETTER-PBR: ${error.message || 'height reconstruction failed'}`);
+        }
     }
 
     /* --------------------------------------------------------------------- */
@@ -457,9 +620,7 @@
     function setEnabled(value) {
         try {
             localStorage.setItem(MO_STORAGE_KEY, value ? '1' : '0');
-        } catch (e) {
-            // Storage is optional. MO still works for the current session.
-        }
+        } catch (e) {}
     }
 
     function getThree() {
@@ -482,7 +643,6 @@
         if (!scene || !THREE_) return null;
         const box = new THREE_.Box3();
         let found = false;
-
         scene.traverse(object => {
             if (!object || !object.visible) return;
             if (!object.isMesh && !object.isSkinnedMesh) return;
@@ -490,7 +650,6 @@
             box.expandByObject(object);
             found = true;
         });
-
         if (!found || box.isEmpty()) return null;
         return box.getCenter(new THREE_.Vector3());
     }
@@ -534,12 +693,10 @@
     function applyFilter(texture, level, THREE_) {
         if (!texture || !THREE_) return;
         rememberTexture(texture);
-
         if (level === 0) {
             restoreTexture(texture);
             return;
         }
-
         texture.generateMipmaps = true;
         texture.minFilter = THREE_.NearestMipmapNearestFilter;
         texture.magFilter = level >= 3 ? THREE_.NearestFilter : THREE_.LinearFilter;
@@ -571,7 +728,6 @@
         if (!running || !isEnabled()) return;
         const THREE_ = getThree();
         if (!THREE_) return;
-
         getPreviews().forEach(preview => {
             const scene = getScene(preview);
             if (!scene) return;
@@ -602,7 +758,6 @@
     function setMO(value) {
         setEnabled(value);
         if (moAction) moAction.setIcon(value ? 'phone_android' : 'phone_disabled');
-
         if (value) {
             updateMO();
             Blockbench.showQuickMessage('MO: Mobile Optimization ON');
@@ -614,18 +769,12 @@
 
     function cleanupDuplicateInstances() {
         if (typeof Plugins === 'undefined' || !Array.isArray(Plugins.all)) return;
-
         const current = Plugins.registered && Plugins.registered[PLUGIN_ID];
         Plugins.all.slice().forEach(plugin => {
             if (!plugin || plugin === current || plugin.id !== PLUGIN_ID) return;
-            try {
-                plugin.unload();
-            } catch (e) {
-                console.warn('BETTER-PBR: failed to unload stale instance', e);
-            }
-            try {
-                Plugins.all.remove(plugin);
-            } catch (e) {
+            try { plugin.unload(); } catch (e) { console.warn('BETTER-PBR: failed to unload stale instance', e); }
+            try { Plugins.all.remove(plugin); }
+            catch (e) {
                 const index = Plugins.all.indexOf(plugin);
                 if (index !== -1) Plugins.all.splice(index, 1);
             }
@@ -635,7 +784,7 @@
     Plugin.register(PLUGIN_ID, {
         title: 'BETTER-PBR',
         author: 'yamasung7-dot',
-        description: 'Generic-first PBR and geometry foundation with MO mobile optimization.',
+        description: 'Generic-first PBR, height-to-geometry foundation, and MO mobile optimization.',
         icon: 'speed',
         version: PLUGIN_VERSION,
         variant: 'both',
@@ -650,13 +799,19 @@
                 name: 'MO — Mobile Optimization',
                 description: 'Toggle mobile optimization. Farther camera distance uses more pixelated texture filtering to reduce GPU work.',
                 icon: isEnabled() ? 'phone_android' : 'phone_disabled',
-                click() {
-                    setMO(!isEnabled());
-                }
+                click() { setMO(!isEnabled()); }
+            });
+
+            geometryAction = new Action('better_pbr_height_to_3d', {
+                name: 'BETTER-PBR — Height to 3D',
+                description: 'Convert the selected texture into a mobile-safe proportional height-field mesh.',
+                icon: 'landscape',
+                click: reconstructSelectedTexture
             });
 
             if (MenuBar && MenuBar.menus && MenuBar.menus.tools) {
                 MenuBar.menus.tools.addAction(moAction);
+                MenuBar.menus.tools.addAction(geometryAction);
             }
 
             Blockbench.on('update_camera_position', scheduleUpdate);
@@ -674,16 +829,16 @@
                 clearTimeout(updateTimer);
                 updateTimer = null;
             }
-
             Blockbench.removeListener('update_camera_position', scheduleUpdate);
             Blockbench.removeListener('render_frame', scheduleUpdate);
             Blockbench.removeListener('update_view', scheduleUpdate);
             Blockbench.removeListener('load_project', scheduleUpdate);
             Blockbench.removeListener('new_project', scheduleUpdate);
-
             restoreAllTextures();
             if (moAction) moAction.delete();
+            if (geometryAction) geometryAction.delete();
             moAction = null;
+            geometryAction = null;
         }
     });
 })();
