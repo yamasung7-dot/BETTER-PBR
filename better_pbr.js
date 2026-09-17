@@ -1,30 +1,34 @@
 /*
  * BETTER-PBR
- * First feature: MO (Mobile Optimization)
  *
- * MO is a lightweight viewport optimization layer for Blockbench.
- * When enabled, textures use increasingly aggressive nearest-mipmap
- * filtering as the camera moves farther from the model. This makes
- * distant surfaces visibly more pixelated while reducing texture
- * filtering work on mobile GPUs.
+ * Foundation-first architecture:
+ * - MO (Mobile Optimization) is the first user-facing feature.
+ * - HeightGeometryFoundation is the stable core for the future
+ *   height-map -> proportional real-geometry pipeline.
+ *
+ * FOUNDATION RULE:
+ * The foundation does not depend on Blockbench's private geometry internals.
+ * It owns data validation, height normalization, sampling, smoothing,
+ * proportional depth mapping, feature thresholds, budgets, cancellation,
+ * and transaction planning. A future Blockbench geometry adapter can consume
+ * the foundation's plan without changing the core math.
  *
  * VERSION RULE:
  * - BETTER-PBR uses whole-number major versions only.
  * - Versions advance 1.0.0 -> 2.0.0 -> 3.0.0 -> 4.0.0, etc.
  * - No minor/patch version progression such as 1.0.1 or 2.0.1.
  *
- * IMPORTANT UPDATE/INSTALL RULE:
- * - There is only one plugin file: better_pbr.js.
- * - The version is embedded in this file.
- * - The startup guard removes stale duplicate BETTER-PBR instances before
- *   the current copy starts, preventing old copies from running alongside it.
+ * UPDATE/INSTALL RULE:
+ * - There is only one plugin implementation file: better_pbr.js.
+ * - Updates replace this file instead of creating versioned/nested copies.
+ * - The startup guard removes stale duplicate BETTER-PBR instances.
  */
 
 (function() {
     'use strict';
 
     const PLUGIN_ID = 'better_pbr';
-    const PLUGIN_VERSION = '1.0.0';
+    const PLUGIN_VERSION = '2.0.0';
     const MO_STORAGE_KEY = 'better_pbr.mo.enabled';
 
     let moAction;
@@ -33,6 +37,414 @@
 
     // Keep original texture sampling settings so MO can be disabled cleanly.
     const originalTextureState = new WeakMap();
+
+    /* --------------------------------------------------------------------- */
+    /* HeightGeometryFoundation                                             */
+    /* --------------------------------------------------------------------- */
+    // This namespace is deliberately independent from Blockbench mesh APIs.
+    // That separation is the main protection against a geometry implementation
+    // error corrupting the rest of the plugin.
+    const HeightGeometryFoundation = (() => {
+        const EPSILON = 1e-8;
+        const DEFAULTS = Object.freeze({
+            maxResolution: 128,
+            maxVertices: 16384,
+            maxFaces: 32768,
+            depth: 1,
+            baseDepth: 0,
+            invert: false,
+            smoothing: 0,
+            lowThreshold: 0.25,
+            highThreshold: 0.75,
+            minimumFeatureSize: 1,
+            wallWidth: 1,
+            edgeSoftness: 0,
+            mode: 'height_field'
+        });
+
+        class FoundationError extends Error {
+            constructor(message, code) {
+                super(message);
+                this.name = 'FoundationError';
+                this.code = code || 'FOUNDATION_ERROR';
+            }
+        }
+
+        class CancellationToken {
+            constructor() {
+                this.cancelled = false;
+            }
+            cancel() {
+                this.cancelled = true;
+            }
+            throwIfCancelled() {
+                if (this.cancelled) {
+                    throw new FoundationError('Geometry operation cancelled.', 'CANCELLED');
+                }
+            }
+        }
+
+        function clamp01(value) {
+            value = Number(value);
+            if (!Number.isFinite(value)) return 0;
+            return Math.max(0, Math.min(1, value));
+        }
+
+        function positiveInt(value, fallback, max) {
+            value = Math.floor(Number(value));
+            if (!Number.isFinite(value) || value < 1) value = fallback;
+            if (max) value = Math.min(value, max);
+            return value;
+        }
+
+        function finiteNumber(value, fallback) {
+            value = Number(value);
+            return Number.isFinite(value) ? value : fallback;
+        }
+
+        function normalizeOptions(options) {
+            options = options || {};
+            const result = Object.assign({}, DEFAULTS, options);
+            result.maxResolution = positiveInt(result.maxResolution, DEFAULTS.maxResolution, 512);
+            result.maxVertices = positiveInt(result.maxVertices, DEFAULTS.maxVertices, 262144);
+            result.maxFaces = positiveInt(result.maxFaces, DEFAULTS.maxFaces, 524288);
+            result.depth = finiteNumber(result.depth, DEFAULTS.depth);
+            result.baseDepth = finiteNumber(result.baseDepth, DEFAULTS.baseDepth);
+            result.smoothing = clamp01(result.smoothing);
+            result.lowThreshold = clamp01(result.lowThreshold);
+            result.highThreshold = clamp01(result.highThreshold);
+            result.minimumFeatureSize = Math.max(0, finiteNumber(result.minimumFeatureSize, DEFAULTS.minimumFeatureSize));
+            result.wallWidth = Math.max(0, finiteNumber(result.wallWidth, DEFAULTS.wallWidth));
+            result.edgeSoftness = clamp01(result.edgeSoftness);
+            result.invert = !!result.invert;
+            result.mode = ['height_field', 'regions', 'hybrid'].includes(result.mode)
+                ? result.mode
+                : DEFAULTS.mode;
+            return Object.freeze(result);
+        }
+
+        function sourceToGray(source) {
+            if (!source) throw new FoundationError('A height-map source is required.', 'NO_SOURCE');
+
+            if (source.data && Number.isInteger(source.width) && Number.isInteger(source.height)) {
+                return {
+                    data: source.data,
+                    width: source.width,
+                    height: source.height,
+                    channels: 4
+                };
+            }
+
+            if (source instanceof Uint8Array || source instanceof Uint8ClampedArray || source instanceof Float32Array) {
+                throw new FoundationError('Typed-array height maps require width and height.', 'MISSING_DIMENSIONS');
+            }
+
+            if (typeof document !== 'undefined' && (source instanceof HTMLImageElement || source instanceof HTMLCanvasElement)) {
+                const canvas = document.createElement('canvas');
+                canvas.width = source.naturalWidth || source.width;
+                canvas.height = source.naturalHeight || source.height;
+                if (!canvas.width || !canvas.height) {
+                    throw new FoundationError('Height-map image has no usable dimensions.', 'BAD_IMAGE');
+                }
+                const context = canvas.getContext('2d', {willReadFrequently: true});
+                if (!context) throw new FoundationError('Could not create a 2D image reader.', 'NO_2D_CONTEXT');
+                context.drawImage(source, 0, 0, canvas.width, canvas.height);
+                const image = context.getImageData(0, 0, canvas.width, canvas.height);
+                return {data: image.data, width: image.width, height: image.height, channels: 4};
+            }
+
+            throw new FoundationError('Unsupported height-map source.', 'BAD_SOURCE');
+        }
+
+        class HeightField {
+            constructor(width, height, values, metadata) {
+                if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
+                    throw new FoundationError('Invalid height-field dimensions.', 'BAD_DIMENSIONS');
+                }
+                if (!values || values.length !== width * height) {
+                    throw new FoundationError('Height-field data does not match its dimensions.', 'BAD_DATA');
+                }
+                this.width = width;
+                this.height = height;
+                this.values = values instanceof Float32Array ? values : Float32Array.from(values);
+                this.metadata = Object.assign({
+                    sourceWidth: width,
+                    sourceHeight: height,
+                    colorSpace: 'linear-luminance',
+                    normalized: true
+                }, metadata || {});
+            }
+
+            index(x, y) {
+                return y * this.width + x;
+            }
+
+            get(x, y) {
+                x = Math.max(0, Math.min(this.width - 1, x | 0));
+                y = Math.max(0, Math.min(this.height - 1, y | 0));
+                return this.values[this.index(x, y)];
+            }
+
+            sample(u, v) {
+                // Bilinear sampling keeps proportional depth continuous instead
+                // of locking the future geometry to integer image pixels.
+                u = clamp01(u);
+                v = clamp01(v);
+                const fx = u * (this.width - 1);
+                const fy = v * (this.height - 1);
+                const x0 = Math.floor(fx);
+                const y0 = Math.floor(fy);
+                const x1 = Math.min(x0 + 1, this.width - 1);
+                const y1 = Math.min(y0 + 1, this.height - 1);
+                const tx = fx - x0;
+                const ty = fy - y0;
+                const a = this.get(x0, y0);
+                const b = this.get(x1, y0);
+                const c = this.get(x0, y1);
+                const d = this.get(x1, y1);
+                return a + (b - a) * tx + (c - a) * ty + (d - a - (b - a)) * tx * ty;
+            }
+
+            clone() {
+                return new HeightField(this.width, this.height, this.values, this.metadata);
+            }
+        }
+
+        function luminance(r, g, b) {
+            // Relative luminance is stable for RGB sources and gives the
+            // foundation a single authoritative grayscale depth value.
+            return clamp01((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255);
+        }
+
+        function fromSource(source, options) {
+            options = normalizeOptions(options);
+            const raw = sourceToGray(source);
+            const target = Math.min(options.maxResolution, Math.max(raw.width, raw.height));
+            const scale = target / Math.max(raw.width, raw.height);
+            const width = Math.max(1, Math.round(raw.width * scale));
+            const height = Math.max(1, Math.round(raw.height * scale));
+            const values = new Float32Array(width * height);
+            const channels = raw.channels || 4;
+
+            for (let y = 0; y < height; y++) {
+                const sy = Math.min(raw.height - 1, Math.floor((y / height) * raw.height));
+                for (let x = 0; x < width; x++) {
+                    const sx = Math.min(raw.width - 1, Math.floor((x / width) * raw.width));
+                    const i = (sy * raw.width + sx) * channels;
+                    let value;
+                    if (channels === 1) {
+                        value = clamp01(Number(raw.data[i]) / 255);
+                    } else {
+                        value = luminance(raw.data[i], raw.data[i + 1], raw.data[i + 2]);
+                    }
+                    values[y * width + x] = options.invert ? 1 - value : value;
+                }
+            }
+
+            return new HeightField(width, height, values, {
+                sourceWidth: raw.width,
+                sourceHeight: raw.height,
+                downsampled: width !== raw.width || height !== raw.height,
+                inverted: options.invert
+            });
+        }
+
+        function smooth(field, amount, token) {
+            amount = clamp01(amount);
+            if (!amount) return field;
+            const source = field.values;
+            const output = new Float32Array(source.length);
+            const radius = amount < 0.34 ? 1 : amount < 0.67 ? 2 : 3;
+
+            for (let y = 0; y < field.height; y++) {
+                if (token && (y & 7) === 0) token.throwIfCancelled();
+                for (let x = 0; x < field.width; x++) {
+                    let sum = 0;
+                    let count = 0;
+                    for (let oy = -radius; oy <= radius; oy++) {
+                        for (let ox = -radius; ox <= radius; ox++) {
+                            const distance = Math.sqrt(ox * ox + oy * oy);
+                            if (distance > radius) continue;
+                            sum += field.get(x + ox, y + oy);
+                            count++;
+                        }
+                    }
+                    const blurred = count ? sum / count : source[field.index(x, y)];
+                    output[field.index(x, y)] = source[field.index(x, y)] * (1 - amount) + blurred * amount;
+                }
+            }
+
+            return new HeightField(field.width, field.height, output, field.metadata);
+        }
+
+        function depthAt(field, u, v, options) {
+            options = normalizeOptions(options);
+            const h = field.sample(u, v);
+            // Height is always proportional to the configured depth range.
+            // 0 is the lowest plane; 1 is the highest plane.
+            return options.baseDepth + h * options.depth;
+        }
+
+        function classify(field, options, token) {
+            options = normalizeOptions(options);
+            const classes = new Uint8Array(field.values.length);
+            for (let y = 0; y < field.height; y++) {
+                if (token && (y & 15) === 0) token.throwIfCancelled();
+                for (let x = 0; x < field.width; x++) {
+                    const value = field.get(x, y);
+                    let kind = 1; // middle/slope
+                    if (value <= options.lowThreshold) kind = 0; // low/recessed
+                    else if (value >= options.highThreshold) kind = 2; // high/raised
+                    classes[field.index(x, y)] = kind;
+                }
+            }
+            return classes;
+        }
+
+        function countRegionCells(field, classes, classId, token) {
+            const visited = new Uint8Array(field.values.length);
+            const regions = [];
+            const queueX = new Int32Array(field.values.length);
+            const queueY = new Int32Array(field.values.length);
+
+            for (let y = 0; y < field.height; y++) {
+                if (token && (y & 15) === 0) token.throwIfCancelled();
+                for (let x = 0; x < field.width; x++) {
+                    const start = field.index(x, y);
+                    if (visited[start] || classes[start] !== classId) continue;
+
+                    let head = 0;
+                    let tail = 0;
+                    queueX[tail] = x;
+                    queueY[tail++] = y;
+                    visited[start] = 1;
+                    let count = 0;
+                    let minX = x, maxX = x, minY = y, maxY = y;
+
+                    while (head < tail) {
+                        const cx = queueX[head];
+                        const cy = queueY[head++];
+                        count++;
+                        minX = Math.min(minX, cx);
+                        maxX = Math.max(maxX, cx);
+                        minY = Math.min(minY, cy);
+                        maxY = Math.max(maxY, cy);
+
+                        const neighbors = [
+                            [cx - 1, cy], [cx + 1, cy],
+                            [cx, cy - 1], [cx, cy + 1]
+                        ];
+                        for (let n = 0; n < neighbors.length; n++) {
+                            const nx = neighbors[n][0];
+                            const ny = neighbors[n][1];
+                            if (nx < 0 || ny < 0 || nx >= field.width || ny >= field.height) continue;
+                            const ni = field.index(nx, ny);
+                            if (visited[ni] || classes[ni] !== classId) continue;
+                            visited[ni] = 1;
+                            queueX[tail] = nx;
+                            queueY[tail++] = ny;
+                        }
+                    }
+
+                    regions.push({
+                        id: regions.length,
+                        classId,
+                        cells: count,
+                        minX,
+                        maxX,
+                        minY,
+                        maxY,
+                        width: maxX - minX + 1,
+                        height: maxY - minY + 1
+                    });
+                }
+            }
+            return regions;
+        }
+
+        function estimateBudget(field, options) {
+            options = normalizeOptions(options);
+            const samples = Math.min(field.width * field.height, options.maxVertices);
+            const side = Math.max(1, Math.floor(Math.sqrt(samples)));
+            const width = Math.min(field.width, side);
+            const height = Math.min(field.height, Math.max(1, Math.floor(samples / width)));
+            const vertices = width * height;
+            const faces = Math.max(0, (width - 1) * (height - 1) * 2);
+            return {
+                requestedSamples: field.width * field.height,
+                plannedWidth: width,
+                plannedHeight: height,
+                estimatedVertices: vertices,
+                estimatedFaces: faces,
+                withinVertexBudget: vertices <= options.maxVertices,
+                withinFaceBudget: faces <= options.maxFaces,
+                safe: vertices <= options.maxVertices && faces <= options.maxFaces
+            };
+        }
+
+        function buildPlan(source, options, token) {
+            options = normalizeOptions(options);
+            token = token || new CancellationToken();
+            token.throwIfCancelled();
+
+            let field = fromSource(source, options);
+            token.throwIfCancelled();
+            field = smooth(field, options.smoothing, token);
+            token.throwIfCancelled();
+
+            const classes = classify(field, options, token);
+            const budget = estimateBudget(field, options);
+            if (!budget.safe) {
+                throw new FoundationError('Geometry budget exceeds the configured mobile-safe limit.', 'BUDGET_EXCEEDED');
+            }
+
+            // Region analysis is computed now because it is cheap compared to
+            // geometry creation and gives future hybrid/extrusion modes a stable
+            // representation of basins and raised regions.
+            const lowRegions = countRegionCells(field, classes, 0, token);
+            const highRegions = countRegionCells(field, classes, 2, token);
+
+            return Object.freeze({
+                version: 1,
+                field,
+                classes,
+                options,
+                budget,
+                regions: Object.freeze({
+                    low: Object.freeze(lowRegions),
+                    high: Object.freeze(highRegions)
+                }),
+                depthAt: (u, v) => depthAt(field, u, v, options)
+            });
+        }
+
+        return Object.freeze({
+            VERSION: 1,
+            DEFAULTS,
+            FoundationError,
+            CancellationToken,
+            HeightField,
+            normalizeOptions,
+            fromSource,
+            smooth,
+            depthAt,
+            classify,
+            estimateBudget,
+            buildPlan,
+            constants: Object.freeze({EPSILON})
+        });
+    })();
+
+    // Expose a namespaced foundation for future feature modules without
+    // polluting the global namespace or coupling the core to Blockbench.
+    if (typeof globalThis !== 'undefined') {
+        globalThis.BETTER_PBR = globalThis.BETTER_PBR || {};
+        globalThis.BETTER_PBR.HeightGeometryFoundation = HeightGeometryFoundation;
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* MO — Mobile Optimization                                             */
+    /* --------------------------------------------------------------------- */
 
     function isEnabled() {
         try {
@@ -61,8 +473,6 @@
     }
 
     function getScene(preview) {
-        // The public Preview API exposes the renderer/camera; Canvas.scene is
-        // available in Blockbench builds that expose the main scene directly.
         if (typeof Canvas !== 'undefined' && Canvas.scene) return Canvas.scene;
         if (preview && preview.scene) return preview.scene;
         return null;
@@ -132,10 +542,7 @@
 
         texture.generateMipmaps = true;
         texture.minFilter = THREE_.NearestMipmapNearestFilter;
-        texture.magFilter = level >= 3
-            ? THREE_.NearestFilter
-            : THREE_.LinearFilter;
-
+        texture.magFilter = level >= 3 ? THREE_.NearestFilter : THREE_.LinearFilter;
         if ('anisotropy' in texture) texture.anisotropy = 1;
         texture.needsUpdate = true;
     }
@@ -144,9 +551,7 @@
         if (!scene) return;
         scene.traverse(object => {
             if (!object || !object.material) return;
-            const materials = Array.isArray(object.material)
-                ? object.material
-                : [object.material];
+            const materials = Array.isArray(object.material) ? object.material : [object.material];
             materials.forEach(material => {
                 if (!material) return;
                 callback(material.map);
@@ -170,7 +575,6 @@
         getPreviews().forEach(preview => {
             const scene = getScene(preview);
             if (!scene) return;
-
             const distance = distanceToModel(preview, scene, THREE_);
             const level = filterLevel(distance);
             walkMaterials(scene, texture => applyFilter(texture, level, THREE_));
@@ -180,7 +584,6 @@
     function scheduleUpdate() {
         if (!running || !isEnabled()) return;
         if (updateTimer) return;
-
         updateTimer = setTimeout(() => {
             updateTimer = null;
             updateMO();
@@ -210,9 +613,6 @@
     }
 
     function cleanupDuplicateInstances() {
-        // Blockbench can temporarily have more than one Plugin object for a
-        // remotely loaded URL. Keep the object currently registered for this
-        // ID and unload any older BETTER-PBR instances so old code cannot run.
         if (typeof Plugins === 'undefined' || !Array.isArray(Plugins.all)) return;
 
         const current = Plugins.registered && Plugins.registered[PLUGIN_ID];
@@ -235,7 +635,7 @@
     Plugin.register(PLUGIN_ID, {
         title: 'BETTER-PBR',
         author: 'yamasung7-dot',
-        description: 'Generic-first PBR and geometry tools with MO mobile optimization.',
+        description: 'Generic-first PBR and geometry foundation with MO mobile optimization.',
         icon: 'speed',
         version: PLUGIN_VERSION,
         variant: 'both',
