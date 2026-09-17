@@ -19,17 +19,27 @@ When MO is enabled:
 
 This is intentionally lightweight: the first optimization targets texture filtering rather than creating extra meshes, extra render passes, or full-resolution replacement textures.
 
+## Versioning rule
+
+BETTER-PBR uses **whole-number major versions only**.
+
+The release sequence is:
+
+**1.0.0 → 2.0.0 → 3.0.0 → 4.0.0 → ...**
+
+We do not use patch/minor version progression such as `1.0.1`, `1.1.0`, or `2.0.1`. Every new BETTER-PBR version moves to the next whole-number major version.
+
 ## Update-safe single-file design
 
 BETTER-PBR keeps the plugin implementation in **one file only**: `better_pbr.js`.
 
-There are no versioned copies, nested old plugin folders, or `better_pbr_v1`, `better_pbr_v2`, etc. When the plugin is updated, the same file is replaced and its embedded semantic version is increased.
+There are no versioned copies, nested old plugin folders, or `better_pbr_v1`, `better_pbr_v2`, etc. When the plugin is updated, the same file is replaced and its version is advanced according to the whole-number versioning rule above.
 
 The plugin also contains a startup cleanup guard. If Blockbench has an older BETTER-PBR instance still present during a URL reinstall/reload, the current instance unloads the stale duplicate before starting. This prevents old and new copies from running together.
 
-For a clean URL reinstall, uninstall BETTER-PBR first, then install the current `better_pbr.js` URL again. Blockbench's current URL loader requests remote plugins without using its normal browser cache, and uninstalling a remote plugin removes its cached local plugin file. citeturn1search0
+For a clean URL reinstall, uninstall BETTER-PBR first, then install the current `better_pbr.js` URL again. Blockbench's current URL loader requests remote plugins without using its normal browser cache, and uninstalling a remote plugin removes its cached local plugin file.
 
-Current version: **0.1.1**
+Current version: **1.0.0**
 
 ## Planned direction
 
