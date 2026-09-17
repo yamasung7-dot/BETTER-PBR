@@ -155,3 +155,45 @@ The foundation must be finished strongly enough that future features can modify,
 
 **Not responsible for:**
 - This is only a surface-orientation correction; it does not add thickness, walls, cavities, trenches, or region-aware geometry.
+
+## 5.0.0 — Face-Aligned Relief Reconstruction
+
+### Textured-Face Targeting
+**What the code is supposed to do:**
+- Find a real Blockbench `Mesh` face that uses the currently selected texture.
+- Prefer a selected face when one exists, then fall back to another matching face on the mesh.
+- Exclude BETTER-PBR's own previously generated relief surfaces from becoming the next target.
+
+**Important constraints:**
+- The reconstruction must be attached to the actual textured model face instead of creating an unrelated floating 16x16 surface at the model origin.
+- The selected texture remains the visual texture and the same face UV region is reused for the generated relief.
+- The system must remain safe on mobile by retaining the existing resolution, vertex, face, and cancellation budgets.
+
+**Integration:**
+- `reconstructSelectedTexture()` resolves the target mesh/face before building the height plan.
+- `GeometryReconstructionEngine.buildSurface()` receives the target face and reconstructs in that face's local coordinate system.
+
+**Not responsible for:**
+- This does not yet infer multiple semantic regions, trenches, cavities, walls, or overhangs.
+- It does not yet generate a dedicated PBR height map separate from the selected source texture.
+
+### Face-Aligned Height Surface
+**What the code is supposed to do:**
+- Sample the foundation height field across the target face's UV bounds.
+- Use `MeshFace.UVToLocal()` to place every generated sample directly on the real model face.
+- Offset each sample along the target face normal by the proportional height value.
+- Preserve the original face UV coordinates on the generated geometry so the selected texture stays aligned with the reconstructed shape.
+
+**Important constraints:**
+- The generated relief inherits the target mesh's origin, rotation, and parent so it remains spatially aligned with the original model.
+- A small outward base offset is used to avoid coplanar z-fighting at zero-height areas.
+- The generated mesh still obeys the mobile-safe grid budget; it does not create one vertex per source pixel.
+
+**Integration:**
+- `GeometryReconstructionEngine.createBlockbenchMesh()` creates a `BETTER-PBR Height Relief` mesh beside the target mesh and assigns the selected texture directly on each generated `MeshFace`.
+- The creation is recorded as one undoable operation.
+
+**Not responsible for:**
+- This remains a height-field relief surface, not a closed solid.
+- It does not yet replace the original face or modify the original mesh in place.
+- It does not yet solve arbitrary non-planar UV islands or volumetric overhangs.
