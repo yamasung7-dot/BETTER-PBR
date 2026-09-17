@@ -28,7 +28,7 @@
     'use strict';
 
     const PLUGIN_ID = 'better_pbr';
-    const PLUGIN_VERSION = '3.0.0';
+    const PLUGIN_VERSION = '4.0.0';
     const MO_STORAGE_KEY = 'better_pbr.mo.enabled';
 
     let moAction;
@@ -476,12 +476,12 @@
                     const c = `v${(y + 1) * width + x + 1}`;
                     const d = `v${(y + 1) * width + x}`;
                     faces.push({
-                        vertices: [a, b, c, d],
+                        vertices: [a, d, c, b],
                         uv: {
                             [a]: [uCoord(x, width), 16 - vCoord(y, height)],
-                            [b]: [uCoord(x + 1, width), 16 - vCoord(y, height)],
+                            [d]: [uCoord(x, width), 16 - vCoord(y + 1, height)],
                             [c]: [uCoord(x + 1, width), 16 - vCoord(y + 1, height)],
-                            [d]: [uCoord(x, width), 16 - vCoord(y + 1, height)]
+                            [b]: [uCoord(x + 1, width), 16 - vCoord(y, height)]
                         }
                     });
                 }
@@ -527,7 +527,10 @@
             }));
             mesh.addFaces(...faceObjects);
             if (texture && typeof mesh.applyTexture === 'function') {
-                mesh.applyTexture(texture);
+                // Blockbench applies a texture to selected mesh faces when the
+                // second argument is omitted. A new mesh has no selected faces,
+                // so explicitly target every generated face.
+                mesh.applyTexture(texture, true);
             }
             mesh.addTo('root');
             if (typeof mesh.calculateNormals === 'function') mesh.calculateNormals();
