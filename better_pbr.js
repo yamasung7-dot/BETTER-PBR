@@ -28,7 +28,7 @@
     'use strict';
 
     const PLUGIN_ID = 'better_pbr';
-    const PLUGIN_VERSION = '4.0.0';
+    const PLUGIN_VERSION = '5.0.0';
     const MO_STORAGE_KEY = 'better_pbr.mo.enabled';
 
     let moAction;
@@ -277,8 +277,7 @@
             return options.baseDepth + h * options.depth;
         }
 
-        function classify(field, options, token) {
-            options = normalizeOptions(options);
+        function classify(field, options, token) {            options = normalizeOptions(options);
             const classes = new Uint8Array(field.values.length);
             for (let y = 0; y < field.height; y++) {
                 if (token && (y & 15) === 0) token.throwIfCancelled();
@@ -426,7 +425,7 @@
     // path first: a proportional height-field surface. Region-aware walls,
     // cavities and hybrid reconstruction remain extension points for DUFP.
     const GeometryReconstructionEngine = (() => {
-        const VERSION = 1;
+        const VERSION = 2;
 
         function chooseGrid(plan) {
             const maxVertices = plan.options.maxVertices;
@@ -439,31 +438,71 @@
             return {width: Math.max(2, width), height: Math.max(2, height)};
         }
 
-        function buildSurface(plan, token) {
+        function getFaceUVBounds(face) {
+            if (!face || !face.uv) {
+                throw new HeightGeometryFoundation.FoundationError('Target face has no UV coordinates.', 'FACE_HAS_NO_UV');
+            }
+            const values = Object.values(face.uv);
+            if (values.length < 3) {
+                throw new HeightGeometryFoundation.FoundationError('Target face does not have enough UV coordinates.', 'BAD_FACE_UV');
+            }
+            let minU = Infinity, minV = Infinity, maxU = -Infinity, maxV = -Infinity;
+            values.forEach(uv => {
+                if (!Array.isArray(uv) || uv.length < 2) return;
+                minU = Math.min(minU, Number(uv[0]));
+                minV = Math.min(minV, Number(uv[1]));
+                maxU = Math.max(maxU, Number(uv[0]));
+                maxV = Math.max(maxV, Number(uv[1]));
+            });
+            if (![minU, minV, maxU, maxV].every(Number.isFinite) || maxU <= minU || maxV <= minV) {
+                throw new HeightGeometryFoundation.FoundationError('Target face UV bounds are invalid.', 'BAD_FACE_UV');
+            }
+            return {minU, minV, maxU, maxV};
+        }
+
+        function buildSurface(plan, targetFace, token) {
             if (!plan || !plan.field || !plan.options) {
                 throw new HeightGeometryFoundation.FoundationError('A valid foundation plan is required.', 'NO_PLAN');
             }
+            if (!targetFace || typeof targetFace.UVToLocal !== 'function' || typeof targetFace.getNormal !== 'function') {
+                throw new HeightGeometryFoundation.FoundationError('The target face cannot map UVs to model space.', 'FACE_MAPPING_UNAVAILABLE');
+            }
+
             token = token || new HeightGeometryFoundation.CancellationToken();
             token.throwIfCancelled();
 
             const grid = chooseGrid(plan);
+            const uvBounds = getFaceUVBounds(targetFace);
+            const normal = targetFace.getNormal(true);
+            const normalX = Number(normal[0]) || 0;
+            const normalY = Number(normal[1]) || 0;
+            const normalZ = Number(normal[2]) || 0;
+
             const vertices = {};
             const faces = [];
             const width = grid.width;
             const height = grid.height;
-            const xScale = width > 1 ? 16 / (width - 1) : 16;
-            const zScale = height > 1 ? 16 / (height - 1) : 16;
 
             for (let y = 0; y < height; y++) {
                 if ((y & 7) === 0) token.throwIfCancelled();
                 const v = y / (height - 1);
+                const uvV = uvBounds.minV + (uvBounds.maxV - uvBounds.minV) * v;
+
                 for (let x = 0; x < width; x++) {
                     const u = x / (width - 1);
+                    const uvU = uvBounds.minU + (uvBounds.maxU - uvBounds.minU) * u;
+                    const point = targetFace.UVToLocal([uvU, uvV]);
+
+                    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y) || !Number.isFinite(point.z)) {
+                        throw new HeightGeometryFoundation.FoundationError('Target face returned an invalid 3D point.', 'BAD_FACE_MAPPING');
+                    }
+
+                    const depth = plan.depthAt(u, v);
                     const key = `v${y * width + x}`;
                     vertices[key] = [
-                        u * 16,
-                        plan.depthAt(u, v),
-                        v * 16
+                        point.x + normalX * depth,
+                        point.y + normalY * depth,
+                        point.z + normalZ * depth
                     ];
                 }
             }
@@ -478,10 +517,10 @@
                     faces.push({
                         vertices: [a, d, c, b],
                         uv: {
-                            [a]: [uCoord(x, width), 16 - vCoord(y, height)],
-                            [d]: [uCoord(x, width), 16 - vCoord(y + 1, height)],
-                            [c]: [uCoord(x + 1, width), 16 - vCoord(y + 1, height)],
-                            [b]: [uCoord(x + 1, width), 16 - vCoord(y, height)]
+                            [a]: [uvBounds.minU + (uvBounds.maxU - uvBounds.minU) * (x / (width - 1)), uvBounds.minV + (uvBounds.maxV - uvBounds.minV) * (y / (height - 1))],
+                            [d]: [uvBounds.minU + (uvBounds.maxU - uvBounds.minU) * (x / (width - 1)), uvBounds.minV + (uvBounds.maxV - uvBounds.minV) * ((y + 1) / (height - 1))],
+                            [c]: [uvBounds.minU + (uvBounds.maxU - uvBounds.minU) * ((x + 1) / (width - 1)), uvBounds.minV + (uvBounds.maxV - uvBounds.minV) * ((y + 1) / (height - 1))],
+                            [b]: [uvBounds.minU + (uvBounds.maxU - uvBounds.minU) * ((x + 1) / (width - 1)), uvBounds.minV + (uvBounds.maxV - uvBounds.minV) * (y / (height - 1))]
                         }
                     });
                 }
@@ -489,7 +528,7 @@
 
             return Object.freeze({
                 version: VERSION,
-                mode: 'height_field_surface',
+                mode: 'face_relief_surface',
                 width,
                 height,
                 vertices: Object.freeze(vertices),
@@ -499,44 +538,45 @@
             });
         }
 
-        function uCoord(index, size) {
-            return size > 1 ? (index / (size - 1)) * 16 : 0;
-        }
-
-        function vCoord(index, size) {
-            return size > 1 ? (index / (size - 1)) * 16 : 0;
-        }
-
-        function createBlockbenchMesh(surface, texture) {
+        function createBlockbenchMesh(surface, targetMesh, texture) {
             if (typeof Mesh === 'undefined' || typeof MeshFace === 'undefined') {
                 throw new HeightGeometryFoundation.FoundationError('Blockbench Mesh APIs are unavailable.', 'MESH_API_UNAVAILABLE');
             }
+            if (!targetMesh) {
+                throw new HeightGeometryFoundation.FoundationError('A target mesh is required.', 'NO_TARGET_MESH');
+            }
 
             const mesh = new Mesh({
-                name: 'BETTER-PBR Height Surface',
+                name: 'BETTER-PBR Height Relief',
                 vertices: surface.vertices,
-                origin: [0, 0, 0],
-                rotation: [0, 0, 0],
+                origin: Array.isArray(targetMesh.origin) ? targetMesh.origin.slice() : [0, 0, 0],
+                rotation: Array.isArray(targetMesh.rotation) ? targetMesh.rotation.slice() : [0, 0, 0],
                 shading: 'smooth',
                 visibility: true
-            }).init();
+            });
+
+            mesh.parent = targetMesh.parent || null;
+            mesh.init();
 
             const faceObjects = surface.faces.map(face => new MeshFace(mesh, {
+                texture: texture || undefined,
                 vertices: face.vertices,
                 uv: face.uv
             }));
             mesh.addFaces(...faceObjects);
-            if (texture && typeof mesh.applyTexture === 'function') {
-                // Blockbench applies a texture to selected mesh faces when the
-                // second argument is omitted. A new mesh has no selected faces,
-                // so explicitly target every generated face.
-                mesh.applyTexture(texture, true);
+
+            if (mesh.parent) {
+                mesh.addTo(mesh.parent);
+            } else {
+                mesh.addTo('root');
             }
-            mesh.addTo('root');
+
             if (typeof mesh.calculateNormals === 'function') mesh.calculateNormals();
+            if (typeof mesh.select === 'function') mesh.select();
+
             if (typeof Canvas !== 'undefined' && Canvas.updateView) {
                 Canvas.updateView({
-                    elements: [mesh],
+                    elements: [mesh, targetMesh],
                     element_aspects: {geometry: true, faces: true, uv: true},
                     selection: true
                 });
@@ -544,7 +584,12 @@
             return mesh;
         }
 
-        return Object.freeze({VERSION, chooseGrid, buildSurface, createBlockbenchMesh});
+        return Object.freeze({
+            VERSION,
+            chooseGrid,
+            buildSurface,
+            createBlockbenchMesh
+        });
     })();
 
     if (typeof globalThis !== 'undefined') {
@@ -566,37 +611,90 @@
         return {texture, source: canvas};
     }
 
+    function faceUsesTexture(face, texture) {
+        if (!face || !texture) return false;
+        let faceTexture = null;
+        if (typeof face.getTexture === 'function') {
+            try { faceTexture = face.getTexture(); } catch (e) {}
+        }
+        return faceTexture === texture ||
+            (faceTexture && faceTexture.uuid === texture.uuid) ||
+            face.texture === texture.uuid;
+    }
+
+    function getTargetMeshAndFace(texture) {
+        if (typeof Mesh === 'undefined') return null;
+
+        const candidates = [];
+        const seen = new Set();
+
+        const addMesh = mesh => {
+            if (!mesh || seen.has(mesh)) return;
+            seen.add(mesh);
+            if (mesh.name === 'BETTER-PBR Height Surface' || mesh.name === 'BETTER-PBR Height Relief') return;
+            candidates.push(mesh);
+        };
+
+        if (Array.isArray(Mesh.selected)) Mesh.selected.forEach(addMesh);
+        if (Array.isArray(Mesh.all)) Mesh.all.forEach(addMesh);
+
+        for (const mesh of candidates) {
+            const selectedFaceKeys = typeof mesh.getSelectedFaces === 'function' ? mesh.getSelectedFaces() : [];
+            for (const key of selectedFaceKeys) {
+                const face = mesh.faces && mesh.faces[key];
+                if (face && faceUsesTexture(face, texture)) {
+                    return {mesh, face};
+                }
+            }
+            for (const key in (mesh.faces || {})) {
+                const face = mesh.faces[key];
+                if (faceUsesTexture(face, texture)) {
+                    return {mesh, face};
+                }
+            }
+        }
+
+        return null;
+    }
+
     function reconstructSelectedTexture() {
         const selected = getSelectedTextureSource();
         if (!selected) {
             Blockbench.showQuickMessage('BETTER-PBR: select a texture first.');
             return;
         }
+
+        const target = getTargetMeshAndFace(selected.texture);
+        if (!target) {
+            Blockbench.showQuickMessage('BETTER-PBR: select a mesh face that uses the selected texture.');
+            return;
+        }
+
         const token = new HeightGeometryFoundation.CancellationToken();
         const options = HeightGeometryFoundation.normalizeOptions({
             maxResolution: Blockbench.isMobile ? 64 : 128,
             maxVertices: Blockbench.isMobile ? 4096 : 16384,
             maxFaces: Blockbench.isMobile ? 8192 : 32768,
             depth: 4,
-            baseDepth: 0,
+            baseDepth: 0.05,
             smoothing: 0,
             mode: 'height_field'
         });
 
         try {
             const plan = HeightGeometryFoundation.buildPlan(selected.source, options, token);
-            const surface = GeometryReconstructionEngine.buildSurface(plan, token);
+            const surface = GeometryReconstructionEngine.buildSurface(plan, target.face, token);
 
             if (typeof Undo !== 'undefined' && Undo.initEdit) {
                 Undo.initEdit({elements: [], outliner: true, selection: true});
             }
 
             try {
-                const mesh = GeometryReconstructionEngine.createBlockbenchMesh(surface, selected.texture);
+                const mesh = GeometryReconstructionEngine.createBlockbenchMesh(surface, target.mesh, selected.texture);
                 if (typeof Undo !== 'undefined' && Undo.finishEdit) {
-                    Undo.finishEdit('BETTER-PBR: Height to 3D');
+                    Undo.finishEdit('BETTER-PBR: Height Relief', {elements: [mesh], outliner: true, selection: true});
                 }
-                Blockbench.showQuickMessage(`BETTER-PBR: created ${surface.vertexCount} vertices / ${surface.faceCount} faces`);
+                Blockbench.showQuickMessage(`BETTER-PBR: created face relief with ${surface.vertexCount} vertices / ${surface.faceCount} faces`);
                 return mesh;
             } catch (error) {
                 if (typeof Undo !== 'undefined' && Undo.cancelEdit) Undo.cancelEdit(true);
@@ -797,7 +895,6 @@
         onload() {
             cleanupDuplicateInstances();
             running = true;
-
             moAction = new Action('better_pbr_mo', {
                 name: 'MO — Mobile Optimization',
                 description: 'Toggle mobile optimization. Farther camera distance uses more pixelated texture filtering to reduce GPU work.',
@@ -807,7 +904,7 @@
 
             geometryAction = new Action('better_pbr_height_to_3d', {
                 name: 'BETTER-PBR — Height to 3D',
-                description: 'Convert the selected texture into a mobile-safe proportional height-field mesh.',
+                description: 'Build mobile-safe proportional relief directly onto the mesh face using the selected texture.',
                 icon: 'landscape',
                 click: reconstructSelectedTexture
             });
