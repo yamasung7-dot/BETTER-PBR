@@ -122,3 +122,36 @@ For every future code change, append a new entry using this structure:
 
 ## Engineering Philosophy
 The foundation must be finished strongly enough that future features can modify, extend, or replace adapters without forcing the core foundation to be rewritten because it was incomplete. If a later feature exposes a foundation weakness, the weakness should be documented and deliberately repaired rather than patched around blindly.
+
+## 4.0.0 — Geometry Output Correction
+
+### Blockbench Texture Assignment Fix
+**What the code is supposed to do:**
+- Apply the selected source texture to every face of the newly-created height surface.
+- Explicitly pass `true` to Blockbench's `Mesh.applyTexture()` so all generated faces receive the texture instead of relying on face selection.
+
+**Important constraints:**
+- A newly-created mesh must not depend on the user's current mesh-face selection state.
+- The fix must use Blockbench's public/current Mesh API rather than directly manipulating renderer materials.
+
+**Integration:**
+- `GeometryReconstructionEngine.createBlockbenchMesh()` creates the mesh and assigns the source texture before the viewport refresh.
+
+**Not responsible for:**
+- This does not change how the source image is interpreted as height.
+- This does not create the future generated PBR height map or DUFP semantic reconstruction.
+
+### Height Surface Face Winding Correction
+**What the code is supposed to do:**
+- Emit the height surface with its front-facing normal directed upward (+Y), matching the intended height-field orientation.
+- Keep the UV coordinates attached to the same physical corners after reversing the quad winding.
+
+**Important constraints:**
+- Preserve the existing proportional height values and mobile vertex/face budgets.
+- Do not change the foundation's height math.
+
+**Integration:**
+- `GeometryReconstructionEngine.buildSurface()` now uses the corrected quad vertex order and matching UV corner assignment.
+
+**Not responsible for:**
+- This is only a surface-orientation correction; it does not add thickness, walls, cavities, trenches, or region-aware geometry.
