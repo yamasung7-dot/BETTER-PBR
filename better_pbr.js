@@ -8,6 +8,11 @@
  * distant surfaces visibly more pixelated while reducing texture
  * filtering work on mobile GPUs.
  *
+ * VERSION RULE:
+ * - BETTER-PBR uses whole-number major versions only.
+ * - Versions advance 1.0.0 -> 2.0.0 -> 3.0.0 -> 4.0.0, etc.
+ * - No minor/patch version progression such as 1.0.1 or 2.0.1.
+ *
  * IMPORTANT UPDATE/INSTALL RULE:
  * - There is only one plugin file: better_pbr.js.
  * - The version is embedded in this file.
@@ -19,7 +24,7 @@
     'use strict';
 
     const PLUGIN_ID = 'better_pbr';
-    const PLUGIN_VERSION = '0.1.1';
+    const PLUGIN_VERSION = '1.0.0';
     const MO_STORAGE_KEY = 'better_pbr.mo.enabled';
 
     let moAction;
