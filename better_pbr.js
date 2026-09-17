@@ -7,12 +7,19 @@
  * filtering as the camera moves farther from the model. This makes
  * distant surfaces visibly more pixelated while reducing texture
  * filtering work on mobile GPUs.
+ *
+ * IMPORTANT UPDATE/INSTALL RULE:
+ * - There is only one plugin file: better_pbr.js.
+ * - The version is embedded in this file.
+ * - The startup guard removes stale duplicate BETTER-PBR instances before
+ *   the current copy starts, preventing old copies from running alongside it.
  */
 
 (function() {
     'use strict';
 
     const PLUGIN_ID = 'better_pbr';
+    const PLUGIN_VERSION = '0.1.1';
     const MO_STORAGE_KEY = 'better_pbr.mo.enabled';
 
     let moAction;
@@ -81,9 +88,6 @@
     }
 
     function filterLevel(distance) {
-        // Distances are deliberately broad because Blockbench projects can
-        // have very different scales. The transitions are smooth enough for
-        // normal orbiting, while still giving a clear distant-pixel effect.
         if (distance < 24) return 0;
         if (distance < 48) return 1;
         if (distance < 96) return 2;
@@ -121,20 +125,12 @@
             return;
         }
 
-        // Nearest-mipmap sampling lets the GPU naturally select smaller
-        // mip levels as the surface gets farther away. The result becomes
-        // progressively more pixelated without rebuilding geometry or images.
         texture.generateMipmaps = true;
         texture.minFilter = THREE_.NearestMipmapNearestFilter;
-
-        // Only force nearest magnification at the farthest levels. This keeps
-        // nearby models looking normal while making distant textures chunky.
         texture.magFilter = level >= 3
             ? THREE_.NearestFilter
             : THREE_.LinearFilter;
 
-        // Anisotropic filtering is expensive on mobile and is less useful for
-        // intentionally pixelated distant textures.
         if ('anisotropy' in texture) texture.anisotropy = 1;
         texture.needsUpdate = true;
     }
@@ -148,9 +144,7 @@
                 : [object.material];
             materials.forEach(material => {
                 if (!material) return;
-                // Main color texture.
                 callback(material.map);
-                // Include common PBR texture slots when present.
                 callback(material.normalMap);
                 callback(material.roughnessMap);
                 callback(material.metalnessMap);
@@ -174,7 +168,6 @@
 
             const distance = distanceToModel(preview, scene, THREE_);
             const level = filterLevel(distance);
-
             walkMaterials(scene, texture => applyFilter(texture, level, THREE_));
         });
     }
@@ -190,8 +183,6 @@
     }
 
     function restoreAllTextures() {
-        // WeakMap cannot be enumerated, so walk current scenes and restore
-        // every texture that MO touched.
         getPreviews().forEach(preview => {
             const scene = getScene(preview);
             walkMaterials(scene, texture => {
@@ -213,16 +204,41 @@
         }
     }
 
+    function cleanupDuplicateInstances() {
+        // Blockbench can temporarily have more than one Plugin object for a
+        // remotely loaded URL. Keep the object currently registered for this
+        // ID and unload any older BETTER-PBR instances so old code cannot run.
+        if (typeof Plugins === 'undefined' || !Array.isArray(Plugins.all)) return;
+
+        const current = Plugins.registered && Plugins.registered[PLUGIN_ID];
+        Plugins.all.slice().forEach(plugin => {
+            if (!plugin || plugin === current || plugin.id !== PLUGIN_ID) return;
+            try {
+                plugin.unload();
+            } catch (e) {
+                console.warn('BETTER-PBR: failed to unload stale instance', e);
+            }
+            try {
+                Plugins.all.remove(plugin);
+            } catch (e) {
+                const index = Plugins.all.indexOf(plugin);
+                if (index !== -1) Plugins.all.splice(index, 1);
+            }
+        });
+    }
+
     Plugin.register(PLUGIN_ID, {
         title: 'BETTER-PBR',
         author: 'yamasung7-dot',
         description: 'Generic-first PBR and geometry tools with MO mobile optimization.',
         icon: 'speed',
-        version: '0.1.0',
+        version: PLUGIN_VERSION,
         variant: 'both',
         min_version: '4.0.0',
+        repository: 'https://github.com/yamasung7-dot/BETTER-PBR',
 
         onload() {
+            cleanupDuplicateInstances();
             running = true;
 
             moAction = new Action('better_pbr_mo', {
@@ -238,8 +254,6 @@
                 MenuBar.menus.tools.addAction(moAction);
             }
 
-            // Camera movement is the main trigger. render_frame is also used
-            // as a fallback so the LOD follows model/camera changes reliably.
             Blockbench.on('update_camera_position', scheduleUpdate);
             Blockbench.on('render_frame', scheduleUpdate);
             Blockbench.on('update_view', scheduleUpdate);
