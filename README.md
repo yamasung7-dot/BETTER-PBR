@@ -19,6 +19,18 @@ When MO is enabled:
 
 This is intentionally lightweight: the first optimization targets texture filtering rather than creating extra meshes, extra render passes, or full-resolution replacement textures.
 
+## Update-safe single-file design
+
+BETTER-PBR keeps the plugin implementation in **one file only**: `better_pbr.js`.
+
+There are no versioned copies, nested old plugin folders, or `better_pbr_v1`, `better_pbr_v2`, etc. When the plugin is updated, the same file is replaced and its embedded semantic version is increased.
+
+The plugin also contains a startup cleanup guard. If Blockbench has an older BETTER-PBR instance still present during a URL reinstall/reload, the current instance unloads the stale duplicate before starting. This prevents old and new copies from running together.
+
+For a clean URL reinstall, uninstall BETTER-PBR first, then install the current `better_pbr.js` URL again. Blockbench's current URL loader requests remote plugins without using its normal browser cache, and uninstalling a remote plugin removes its cached local plugin file. citeturn1search0
+
+Current version: **0.1.1**
+
 ## Planned direction
 
 The next BETTER-PBR stage can use generated height maps to create real geometry depth, including raised areas, basins, trenches, walls, and cavities, while keeping the original texture for appearance/UVs.
