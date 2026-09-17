@@ -18,7 +18,7 @@ The notes are documentation only. They do not contain executable plugin logic.
 - Updates replace the existing implementation rather than adding another copy.
 - This notes file is documentation and is intentionally separate from the executable plugin file.
 
-## 2.0.0 — Current Foundation + MO
+## 2.0.0 — Foundation + MO
 
 ### MO — Mobile Optimization
 **What the code is supposed to do:**
@@ -43,13 +43,62 @@ The notes are documentation only. They do not contain executable plugin logic.
 - Preserve proportional depth: a height value of `0` maps to the low end of the configured depth range and `1` maps to the high end.
 - Provide continuous bilinear sampling so future geometry does not have to be locked to integer image pixels.
 - Provide optional smoothing, low/middle/high classification, connected low/high region analysis, resource budgeting, and cancellation support.
-- Produce a validated processing plan that a future geometry adapter can consume.
-- Keep all of this core logic independent from Blockbench's private mesh/geometry implementation details.
+- Produce a validated processing plan that a geometry reconstruction layer can consume.
+- Keep all of this core logic independent from Blockbench's mesh/geometry implementation details.
 
 **Important boundary:**
-- The foundation does **not** yet create the final Blockbench geometry.
-- Future contour extraction, triangulation, extrusion/cutout behavior, wall construction, simplification, and geometry committing belong in later layers that consume this foundation.
-- The foundation must remain stable while those later layers evolve.
+- The foundation does not create final Blockbench geometry.
+- Contour extraction, triangulation, extrusion/cutout behavior, wall construction, simplification, and advanced DUFP decisions remain later layers.
+- The foundation must remain stable while those layers evolve.
+
+## 3.0.0 — First Geometry Reconstruction Engine
+
+### GeometryReconstructionEngine
+**What the code is supposed to do:**
+- Consume a validated `HeightGeometryFoundation` plan without changing the foundation's height/depth math.
+- Build the first real geometry representation from the height field using a simple indexed-style grid of Blockbench mesh vertices and quad faces.
+- Map normalized height proportionally into the mesh's Y coordinate using the foundation's authoritative `depthAt()` function.
+- Preserve a predictable 0..16 UV domain across the generated surface so the selected source texture can be applied to the reconstructed mesh.
+- Choose a grid resolution from the foundation's configured vertex budget instead of blindly creating one vertex per source pixel.
+- Check cancellation during vertex and face generation so a future progressive/mobile workflow can stop work safely.
+- Provide a separate Blockbench adapter that commits the finished surface as a real `Mesh`, applies the selected texture, adds it to the root outliner, and requests a view update.
+
+**Important constraints:**
+- Version 3.0.0 intentionally implements only the simplest auditable reconstruction path: a proportional height-field surface.
+- Mobile mode uses a lower reconstruction budget (`64` maximum source resolution and `4096` maximum vertices) for the first implementation.
+- The engine must not create one vertex per 1024x1024 source pixel.
+- Geometry creation is separated from the foundation so Blockbench-specific API changes do not force the mathematical foundation to be rewritten.
+- The implementation is designed for generic image-based geometry, not only Minecraft vanilla blocks.
+
+**Integration:**
+- `HeightGeometryFoundation.buildPlan()` produces the validated input.
+- `GeometryReconstructionEngine.buildSurface()` converts that plan into mesh data.
+- `GeometryReconstructionEngine.createBlockbenchMesh()` is the Blockbench-specific commit adapter.
+- The new Tools action `BETTER-PBR — Height to 3D` currently uses the selected texture's canvas as the height source so the reconstruction path can be exercised before the future PBR/DUFP height-map source is connected.
+
+**Not responsible for:**
+- It does not yet infer semantic regions such as trenches, cavities, walls, or raised islands.
+- It does not yet perform contour extraction, marching-squares boundary reconstruction, polygon triangulation, region extrusion, or hybrid surface/region decisions.
+- It does not yet generate a full PBR material or automatically produce a dedicated generated height map from the original texture.
+- Those responsibilities belong to the next understanding/DUFP layers after this basic geometry path is validated.
+
+### Blockbench Geometry Commit Adapter
+**What the code is supposed to do:**
+- Translate the engine's neutral surface representation into Blockbench's current `Mesh` and `MeshFace` APIs.
+- Preserve the generated vertex positions and UV coordinates.
+- Apply the selected texture to the generated mesh.
+- Add the mesh to the root outliner and refresh the viewport.
+- Wrap the creation in Blockbench's undo system so the generated object can be reverted.
+
+**Important constraints:**
+- The adapter is the only part of the new reconstruction path that directly depends on Blockbench mesh APIs.
+- The adapter must fail with a controlled error when the required `Mesh`/`MeshFace` APIs are unavailable.
+- No private Three.js scene object is used as the permanent model representation.
+
+**Not responsible for:**
+- It does not decide how height values are interpreted.
+- It does not analyze the image or choose geometry strategies.
+- It does not replace the foundation's budgets or cancellation rules.
 
 ## Future Note Format
 For every future code change, append a new entry using this structure:
